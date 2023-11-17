@@ -671,3 +671,6 @@ notebooks/data/*
 notebooks/plots/*
 notebooks/sandbox.ipynb
 
+joblog/
+prepare_env.sh
+submit.sub
