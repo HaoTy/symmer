@@ -61,9 +61,9 @@ if __name__ == "__main__":
 
     pickle.dump(
         {
-            "H": H,
-            "H_taper": H_taper,
-            "H_cs": H_cs,
+            "H": H.to_dictionary,
+            "H_taper": H_taper.to_dictionary,
+            "H_cs": H_cs.to_dictionary,
             "cs_state": gs_psi,
             "n_qubits": H.n_qubits,
             "n_taper": H.n_qubits - QT.n_taper,

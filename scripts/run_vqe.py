@@ -65,6 +65,7 @@ if __name__ == "__main__":
         result = vqe.compute_minimum_eigenvalue(H_qiskit)
         if result.optimal_value < data["fci_energy"] + 0.0016:
             indicator = "success"
+            best_result = result
             break
         if result.optimal_value < curr_lowest:
             curr_lowest = result.optimal_value
