@@ -1,6 +1,7 @@
 import argparse
 import json
 import pickle
+from re import A
 
 import numpy as np
 
@@ -43,16 +44,20 @@ if __name__ == "__main__":
         unitary_partitioning_method="LCU",
     )
 
-    for n in range(1, QT.n_taper + 1):
-        cs_vqe.update_stabilizers(
-            n_qubits=n, strategy="aux_preserving", aux_operator=UCC_taper
-        )
-        # hf_cs = cs_vqe.project_state_onto_subspace(QT.tapered_ref_state)
-        H_cs = cs_vqe.project_onto_subspace()
-        print(H_cs)
-        gs_nrg, gs_psi = exact_gs_energy(H_cs.to_sparse_matrix)
-        if gs_nrg <= fci_energy + 0.0016:
-            break
+    for n in range(1, H.n_qubits - QT.n_taper + 1):
+        try:
+            cs_vqe.update_stabilizers(
+                n_qubits=n, strategy="aux_preserving", aux_operator=UCC_taper
+            )
+            # hf_cs = cs_vqe.project_state_onto_subspace(QT.tapered_ref_state)
+            H_cs = cs_vqe.project_onto_subspace()
+            print(H_cs)
+            gs_nrg, gs_psi = exact_gs_energy(H_cs.to_sparse_matrix)
+            if gs_nrg <= fci_energy + 0.0016:
+                break
+        except Exception as e:
+            print(n, e)
+            continue
 
     pickle.dump(
         {
@@ -61,7 +66,7 @@ if __name__ == "__main__":
             "H_cs": H_cs,
             "cs_state": gs_psi,
             "n_qubits": H.n_qubits,
-            "n_taper": QT.n_taper,
+            "n_taper": H.n_qubits - QT.n_taper,
             "n_cs": n,
             "fci_energy": fci_energy,
         },
