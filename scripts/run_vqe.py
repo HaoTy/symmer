@@ -1,6 +1,7 @@
 import argparse
 import os
 import pickle
+import warnings
 
 import numpy as np
 from qiskit.algorithms.optimizers import COBYLA
@@ -9,7 +10,10 @@ from qiskit.utils import QuantumInstance
 from qiskit_aer import AerSimulator
 from qiskit_aer.primitives import Estimator
 
+from symmer.operators import PauliwordOp
+
 if __name__ == "__main__":
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--molecule", type=str, default="Be")
     parser.add_argument("-p", type=int, default=0)
@@ -23,7 +27,7 @@ if __name__ == "__main__":
 
     filename = f"{args.molecule}_STO-3G_SINGLET_JW"
     data = pickle.load(open(f"data/cs_op/{filename}.pckl", "rb"))
-    H_qiskit = data[args.target].to_qiskit
+    H_qiskit = PauliwordOp.from_dictionary(data[args.target]).to_qiskit
     n = H_qiskit.num_qubits
 
     rng = np.random.default_rng(args.seed)
