@@ -45,22 +45,13 @@ Qubit reduction techniques such as [tapering](https://arxiv.org/abs/1701.08213) 
 
 ## Performance
 
-Why should you use Symmer? It has been designed for high efficiency when manipulating large Pauli operators -- addition, multiplication, Clifford/general rotations, commutativity/contextuality checks, symmetry basis identification, basis reconstruction and subspace projections have all been reformulated in the symplectic representation and implemented carefully to avoid unnecessary operations and redundancy. But don't just take our word for it, see these benchmarks against various popular quantum computing packages:
+Why should you use Symmer? It has been designed for high efficiency when manipulating large Pauli operators -- addition, multiplication, Clifford/general rotations, commutativity/contextuality checks, symmetry generation, basis reconstruction and subspace projections have all been reformulated in the symplectic representation and implemented carefully to avoid unnecessary operations and redundancy. It also has a QASM simulator for evaluating expectation values, which is efficient when restricted to Clifford operations. 
 
-Single Pauli Multiplication |  Squaring Linear Combinations
-:--------------------------:|:-----------------------------:
-![](https://github.com/UCL-CCS/symmer/blob/main/images/single_pauli_mult.png) | ![](https://github.com/UCL-CCS/symmer/blob/main/images/squaring_100q_linear_combs.png)
-Runtime for phased multiplication of single Pauli operators $P,Q \in \mathcal{P}_N$ with $N \leq 10^8$. Symmer and Qiskit are comparable throughout, with the latter slightly favourable for large numbers of qubits; Stim excels here as it is highly optimized for such operations. | Squaring 100-qubit Pauli operators with increasing numbers of terms. This benchmark is particularly challenging as it probes the efficiency of multiplication, addition and the subsequent collection of like-terms.
-
-Clifford Rotations          |  General Rotations
-:--------------------------:|:-----------------------------:
-![](https://github.com/UCL-CCS/symmer/blob/main/images/100q_clifford_rotations.png) | ![](https://github.com/UCL-CCS/symmer/blob/main/images/100q_general_rotations.png)
-Clifford rotation of 100-qubit Pauli operators with increasing numbers of terms; this tests commutativity checks and multiplication. Symmer has been optimized with this in mind since it is one of the core operations necessary for stabilizer subspace projection techniques. | General (non-Clifford) rotations of 100-qubit Pauli operators with increasing numbers of terms; this tests commutativity checks and multiplication, as well as addition and the subsequent cleanup operation. This is relevant for performing [unitary partitioning](https://arxiv.org/abs/2207.03451) in [CS-VQE](https://quantum-journal.org/papers/q-2021-05-14-456/).
-
-### To conclude, what can Symmer do on a standard i5 laptop in just _one_ second?
+### What can Symmer do on a standard laptop in just _one_ second?
+- Evaluate the expectation value of a 1,000-qubit Clifford circuit with a depth of 2,000.
+- Perform a non-Clifford unitary rotation of a 1,000-qubit operator with 100,000 Pauli terms.
+- Square a 1,000-qubit operator with 500 Pauli terms, involving a cleanup procedure over 250,000 cross terms.
 - Multiply two 100,000,000-qubit Pauli terms together.
-- Square a 100-qubit Pauli operator with 1,000 terms, involving a cleanup procedure over 1,000,000 cross terms.
-- Perform a unitary rotation of a 100-qubit Pauli operator with 1,000,000 terms.
 
 All this allows us to approach significantly larger systems than was previously possible, including those exceeding the realm of classical tractibility.
 
@@ -68,6 +59,10 @@ All this allows us to approach significantly larger systems than was previously 
 
 When you use in a publication or other work, please cite as:
 
+> Tim Weaving, Alexis Ralli, Peter J. Love, Sauro Succi, and Peter V. Coveney. *Contextual Subspace Variational Quantum Eigensolver Calculation of the Dissociation Curve of Molecular Nitrogen on a Superconducting Quantum Computer.* [arXiv preprint arXiv:2312.04392](https://arxiv.org/abs/2312.04392) (2023).
+
+> Alexis Ralli, Tim Weaving, Andrew Tranter, William M. Kirby, Peter J. Love, and Peter V. Coveney. *Unitary partitioning and the contextual subspace variational quantum eigensolver.* [Phys. Rev. Research 5, 013095](https://doi.org/10.1103/PhysRevResearch.5.013095) (2023).
+
+> Tim Weaving, Alexis Ralli, William M. Kirby, Andrew Tranter, Peter J. Love, and Peter V. Coveney. *A Stabilizer Framework for the Contextual Subspace Variational Quantum Eigensolver and the Noncontextual Projection Ansatz.* [J. Chem. Theory Comput. 2023, 19, 3, 808–821](https://doi.org/10.1021/acs.jctc.2c00910) (2023).
+
 > William M. Kirby, Andrew Tranter, and Peter J. Love, *Contextual Subspace Variational Quantum Eigensolver*, [Quantum 5, 456](https://doi.org/10.22331/q-2021-05-14-456) (2021).
-> Weaving, Tim, Alexis Ralli, William M. Kirby, Andrew Tranter, Peter J. Love, and Peter V. Coveney. "A Stabilizer Framework for the Contextual Subspace Variational Quantum Eigensolver and the Noncontextual Projection Ansatz." [J. Chem. Theory Comput. 2023, 19, 3, 808–821](https://doi.org/10.1021/acs.jctc.2c00910) (2023).
-> Ralli, Alexis, Tim Weaving, Andrew Tranter, William M. Kirby, Peter J. Love, and Peter V. Coveney. "Unitary partitioning and the contextual subspace variational quantum eigensolver." [Phys. Rev. Research 5, 013095](https://doi.org/10.1103/PhysRevResearch.5.013095) (2023).

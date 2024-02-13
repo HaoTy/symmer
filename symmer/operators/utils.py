@@ -2,7 +2,44 @@ import numpy as np
 import scipy as sp
 from typing import Tuple, Dict
 from openfermion import QubitOperator
-from qiskit.opflow import PauliSumOp
+from qiskit.quantum_info import SparsePauliOp
+from qiskit._accelerate.sparse_pauli_op import unordered_unique
+import numba as nb
+
+@nb.njit(fastmath=True, parallel=True, cache=True)
+def matmul_GF2(A: np.array, B: np.array) -> np.array:
+    """
+    custom GF(2) multiplication using numba. i.e. C = (A@B) mod 2.
+    
+    Note function uses fact that multiplication over GF2 doesn't require sums for each matrix element in C
+    instead it uses and AND operation (same as elementwise multiplicaiton of row,col pairs) 
+    followed by XOR operation (same as taking sum of row,col multiplied pairs)
+    
+    Args:
+        A (np.array): numpy boolean array
+        B (np.array): numpy boolean array
+    Returns:
+        C (np.array): numpy boolean array of (A@B) mod 2
+    """
+    C = np.empty((A.shape[0], B.shape[1]), dtype=np.bool_)
+    for i in nb.prange(C.shape[0]):
+        for j in range(C.shape[1]):
+
+            ## logical version 1 (slower) 
+            # C[i, j] = bool(np.sum(np.logical_and(A[i, :], B[:, j]))%2)
+
+            # # logical version 2 (slower) 
+            # parity = False
+            # for bit in np.logical_and(A[i, :], B[:, j]):
+            #     parity^=bit
+            # C[i, j] = parity
+
+            ## faster loop
+            acc = False
+            for k in range(B.shape[0]):
+                acc ^= A[i, k] & B[k, j]
+            C[i, j] = acc
+    return C
 
 def symplectic_to_string(symp_vec) -> str:
     """
@@ -32,6 +69,37 @@ def symplectic_to_string(symp_vec) -> str:
     Pword_string = ''.join(char_aray)
 
     return Pword_string
+
+def symplectic_to_openfermion(symp_vec, coeff) -> str:
+    """Returns string form of symplectic vector defined as (X | Z).
+
+    Args:
+        symp_vec (array): symplectic Pauliword array
+
+    Returns:
+        Pword_string (str): String version of symplectic array
+    """
+    n_qubits = len(symp_vec) // 2
+
+    X_block = symp_vec[:n_qubits]
+    Z_block = symp_vec[n_qubits:]
+
+    Y_loc = np.logical_and(X_block, Z_block)
+    X_loc = np.logical_xor(Y_loc, X_block)
+    Z_loc = np.logical_xor(Y_loc, Z_block)
+
+    char_aray = np.array(list("I" * n_qubits), dtype=str)
+
+    char_aray[Y_loc] = "Y"
+    char_aray[X_loc] = "X"
+    char_aray[Z_loc] = "Z"
+
+    indices = np.array(range(n_qubits), dtype=str)
+    char_aray = np.char.add(char_aray, indices)[np.where(char_aray != "I")[0]]
+
+    Pword_string = " ".join(char_aray)
+
+    return QubitOperator(Pword_string, coeff)
 
 def string_to_symplectic(pauli_str, n_qubits):
     """
@@ -140,28 +208,38 @@ def symplectic_cleanup(
     Returns: 
         Reduced symplectic matrix and reduced coefficient vector.
     """
-    # order lexicographically using a fast void view implementation...
-    # this scales to large numbers of qubits more favourably than np.lexsort
-    symp_matrix_view = np.ascontiguousarray(symp_matrix).view(
-        np.dtype((np.void, symp_matrix.dtype.itemsize * symp_matrix.shape[1]))
-    )
-    re_order_indices = np.argsort(symp_matrix_view.ravel())
-    # sort the symplectic matrix and vector of coefficients accordingly
-    sorted_terms = symp_matrix[re_order_indices]
-    sorted_coeff = coeff_vec[re_order_indices]
-    # unique terms are those with non-zero entries in the adjacent row difference array
-    diff_adjacent = np.diff(sorted_terms, axis=0)
-    mask_unique_terms = np.append(True, np.any(diff_adjacent, axis=1))
-    reduced_symp_matrix = sorted_terms[mask_unique_terms]
-    # mask the term indices such that those which are skipped are summed under np.reduceat
-    summing_indices = np.arange(symp_matrix.shape[0])[mask_unique_terms]
-    reduced_coeff_vec = np.add.reduceat(sorted_coeff, summing_indices, axis=0)
-    # if a zero threshold is specified terms with sufficiently small coefficient will be dropped
+    # # order lexicographically using a fast void view implementation...
+    # # this scales to large numbers of qubits more favourably than np.lexsort
+    # symp_matrix_view = np.ascontiguousarray(symp_matrix).view(
+    #     np.dtype((np.void, symp_matrix.dtype.itemsize * symp_matrix.shape[1]))
+    # )
+    # re_order_indices = np.argsort(symp_matrix_view.ravel())
+    # # sort the symplectic matrix and vector of coefficients accordingly
+    # sorted_terms = symp_matrix[re_order_indices]
+    # sorted_coeff = coeff_vec[re_order_indices]
+    # # unique terms are those with non-zero entries in the adjacent row difference array
+    # diff_adjacent = np.diff(sorted_terms, axis=0)
+    # mask_unique_terms = np.append(True, np.any(diff_adjacent, axis=1))
+    # reduced_symp_matrix = sorted_terms[mask_unique_terms]
+    # # mask the term indices such that those which are skipped are summed under np.reduceat
+    # summing_indices = np.arange(symp_matrix.shape[0])[mask_unique_terms]
+    # reduced_coeff_vec = np.add.reduceat(sorted_coeff, summing_indices, axis=0)
+    # # if a zero threshold is specified terms with sufficiently small coefficient will be dropped
+    # if zero_threshold is not None:
+    #     mask_nonzero = abs(reduced_coeff_vec)>zero_threshold
+    #     reduced_symp_matrix = reduced_symp_matrix[mask_nonzero]
+    #     reduced_coeff_vec = reduced_coeff_vec[mask_nonzero]
+
+    # return reduced_symp_matrix, reduced_coeff_vec
+
+    unique_locations, inverse_map = unordered_unique(symp_matrix.astype('uint16'))
+    reduced_symp_matrix = symp_matrix[unique_locations]
+    reduced_coeff_vec = np.zeros(unique_locations.shape[0], dtype=complex)
+    np.add.at(reduced_coeff_vec, inverse_map, coeff_vec)
     if zero_threshold is not None:
         mask_nonzero = abs(reduced_coeff_vec)>zero_threshold
         reduced_symp_matrix = reduced_symp_matrix[mask_nonzero]
         reduced_coeff_vec = reduced_coeff_vec[mask_nonzero]
-
     return reduced_symp_matrix, reduced_coeff_vec
 
 def random_symplectic_matrix(n_qubits,n_terms, diagonal=False, density=0.3):
@@ -269,20 +347,19 @@ def QubitOperator_to_dict(op: QubitOperator, num_qubits: int):
          
     return op_dict
 
-def PauliSumOp_to_dict(op:PauliSumOp) -> dict:
+def SparsePauliOp_to_dict(op:SparsePauliOp) -> dict:
     """ 
     Qiskit
     
     Args:
-        op (PauliSumOp): Pauli Sum Operator
+        op (SparsePauliOp): Pauli Sum Operator
 
     Returns:
         Dictionary format of Pauli Sum Operator.
     """
     H_dict = {}
-    for P_term in op.to_pauli_op():
-        Pstr = P_term.primitive.to_label()
-        H_dict[Pstr] = P_term._coeff
+    for Pstr, coeff in op.to_list():
+        H_dict[Pstr] = coeff
     return H_dict
 
 def safe_PauliwordOp_to_dict(op) -> Dict[str, Tuple[float, float]]:
@@ -535,34 +612,20 @@ def perform_noncontextual_sweep(operator) -> "PauliwordOp":
         List of terms maintaining noncontextuality.
     """
 
-    # # initialize noncontextual operator with first element of input operator
-    # noncon_indices = np.array([0])
-    # adjmat = np.array([[True]], dtype=bool)
-    # for index, term in enumerate(operator[1:]):
-    #     # pad the adjacency matrix term-by-term - avoids full construction each time
-    #     adjmat_vector = np.append(term.commutes_termwise(operator[noncon_indices]), True)
-    #     adjmat_padded = np.pad(adjmat, pad_width=((0, 1), (0, 1)), mode='constant')
-    #     adjmat_padded[-1,:] = adjmat_vector; adjmat_padded[:,-1] = adjmat_vector
-    #     # check whether the adjacency matrix has a noncontextual structure
-    #     if check_adjmat_noncontextual(adjmat_padded):
-    #         noncon_indices = np.append(noncon_indices, index+1)
-    #         adjmat = adjmat_padded
+    # initialize noncontextual operator with first element of input operator
+    noncon_indices = np.array([0])
+    adjmat = np.array([[True]], dtype=bool)
+    for index, term in enumerate(operator[1:]):
+        # pad the adjacency matrix term-by-term - avoids full construction each time
+        adjmat_vector = np.append(term.commutes_termwise(operator[noncon_indices]), True)
+        adjmat_padded = np.pad(adjmat, pad_width=((0, 1), (0, 1)), mode='constant')
+        adjmat_padded[-1,:] = adjmat_vector; adjmat_padded[:,-1] = adjmat_vector
+        # check whether the adjacency matrix has a noncontextual structure
+        if check_adjmat_noncontextual(adjmat_padded):
+            noncon_indices = np.append(noncon_indices, index+1)
+            adjmat = adjmat_padded
 
-    # return operator[noncon_indices] 
-
-    ## new method uses generators to speed up sweep
-    from symmer.operators import PauliwordOp
-    mask = np.zeros(operator.n_terms, dtype=bool)
-
-    for ind in range(operator.n_terms):
-        mask[ind] = ~mask[ind]
-        running_op = PauliwordOp(operator.symp_matrix[mask],
-                                 np.ones(np.sum(mask)))
-
-        if not running_op.is_noncontextual:
-            mask[ind] = ~mask[ind]
-
-    return operator[mask]
+    return operator[noncon_indices] 
 
 def binary_array_to_int(bin_arr):
     """

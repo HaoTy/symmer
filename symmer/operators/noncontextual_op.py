@@ -2,13 +2,12 @@ import warnings
 import itertools
 import numpy as np
 import networkx as nx
-import qubovert as qv
 from cached_property import cached_property
 from time import time
 from functools import reduce
 from typing import Optional, Union, Tuple, List
 from matplotlib import pyplot as plt
-from scipy.optimize import differential_evolution, shgo
+from scipy.optimize import shgo
 from symmer.operators import PauliwordOp, IndependentOp, AntiCommutingOp, QuantumState
 from symmer.operators.utils import binomial_coefficient, perform_noncontextual_sweep
 from symmer.utils import random_anitcomm_2n_1_PauliwordOp
@@ -250,65 +249,70 @@ class NoncontextualOp(PauliwordOp):
             _, noncontextual_terms_mask = H.generator_reconstruction(generators, override_independence_check=True)
 
         return cls.from_PauliwordOp(H[noncontextual_terms_mask])
-
     @classmethod
     def random(cls,
             n_qubits: int,
             n_cliques:Optional[int]=3,
             complex_coeffs:Optional[bool]=False,
             n_commuting_terms:Optional[int]=None,
+            apply_clifford: Optional[bool] = True,
         ) -> "NoncontextualOp":
         """
         Generate a random Noncontextual operator with normally distributed coefficients.
         Note to maximise size choose number of n_cliques to be 3 (and for 2<= n_cliques <= 5 the operator
         will be larger than only using commuting generators).
-        WARNING: this function can generates an exponentially large Hamiltonian unless n_terms set.
-        size when NOT set is: n_cliques * [ 2**(n_qubits -  int(np.ceil((n_cliques - 1) / 2))) ]
 
-        Note: The number of terms in output will be: n_cliques*n_commuting_terms
+        WARNING: this function can generates an exponentially large Hamiltonian unless n_terms set.
+        size when NOT set is: n_cliques * [ 2**(n_qubits -  int(np.ceil((n_cliques - 1) / 2))) ] + n_commuting_terms
+
+        Note: The number of terms in output will be: n_cliques*n_commuting_terms + n_commuting_terms
+              apart from when n_commuting_terms=0 in which case = n_cliques
 
         Args:
             n_qubits (int): Number of qubits noncontextual operator defined on
             n_cliques (int): Number of cliques representives in operator
             complex_coeffs (bool): Whether to generate complex coefficients (default: True).
             n_commuting_terms (int): Optional int for number of commuting terms. if not set then it will be: 2**(n_qubits -  int(np.ceil((n_cliques - 1) / 2))) (i.e. exponentially large)
-
+            apply_clifford (bool): Whether to apply clifford before output (to get rid of structure used to build Hnc)
         Returns:
             NoncontextualOp: A random NoncontextualOp object.
         """
-        assert n_cliques > 1, 'number of cliques must be set to 2 or more (cannot have one anticommuting term)'
+        assert n_cliques > 1 or n_cliques == 0, 'number of cliques must be zero or set to 2 or more (cannot have one anticommuting term)'
         n_clique_qubits = int(np.ceil((n_cliques - 1) / 2))
-        assert n_clique_qubits <= n_qubits, 'cannot have {n_cliques} anticommuting cliques on {n_qubits} qubits'
+        assert n_clique_qubits <= n_qubits, f'cannot have {n_cliques} anticommuting cliques on {n_qubits} qubits'
 
         remaining_qubits = n_qubits - n_clique_qubits
 
         if n_commuting_terms:
-            assert n_commuting_terms<= 2**remaining_qubits, f'cannot have {n_commuting_terms} commuting operators on {remaining_qubits} qubits'
+            assert n_commuting_terms <= 2 ** remaining_qubits, f'cannot have {n_commuting_terms} commuting operators on {remaining_qubits} qubits'
+        elif n_qubits == n_clique_qubits:
+            n_commuting_terms = 0
 
-        if remaining_qubits>=1:
-            if n_commuting_terms==None:
+        if remaining_qubits >= 1:
+            if n_commuting_terms == None:
                 n_commuting_terms = 2 ** (remaining_qubits)
                 XZ_block = (((np.arange(n_commuting_terms)[:, None] & (1 << np.arange(2 * remaining_qubits))[
-                                                                            ::-1])) > 0).astype(bool)
+                                                                      ::-1])) > 0).astype(bool)
+            elif n_commuting_terms == 0:
+                XZ_block = np.zeros(2 * remaining_qubits, dtype=bool).reshape([1, -1])
             else:
                 # randomly chooise Z bitstrings in symp matrix:
                 indices = np.unique(np.random.random_integers(0,
-                                                              high=2**remaining_qubits-1,
-                                                              size=10*n_commuting_terms))
+                                                              high=2 ** remaining_qubits - 1,
+                                                              size=10 * n_commuting_terms))
                 while len(indices) < n_commuting_terms:
                     indices = np.unique(np.append(indices,
                                                   np.unique(np.random.random_integers(0,
                                                                                       high=2 ** remaining_qubits - 1,
-                                                                                      size=10*n_commuting_terms)))
+                                                                                      size=10 * n_commuting_terms)))
                                         )
 
                 indices = indices[:n_commuting_terms]
                 XZ_block = (((indices[:, None] & (1 << np.arange(2 * remaining_qubits))[
-                                                                        ::-1])) > 0).astype(bool)
+                                                 ::-1])) > 0).astype(bool)
 
         if n_cliques == 0:
             H_nc = PauliwordOp(XZ_block, np.ones(XZ_block.shape[0]))
-
         else:
             AC = random_anitcomm_2n_1_PauliwordOp(n_clique_qubits,
                                                   apply_clifford=True)[:n_cliques]
@@ -319,22 +323,28 @@ class NoncontextualOp(PauliwordOp):
                 diag_H = PauliwordOp.from_list(['I' * remaining_qubits])
 
             AC_full = PauliwordOp.from_list(['I' * remaining_qubits]).tensor(AC)
+
             H_sym = diag_H.tensor(PauliwordOp.from_list(['I' * n_clique_qubits]))
-            H_nc = AC_full * H_sym
-            assert AC.n_terms * n_commuting_terms == H_nc.n_terms, 'operator not largest it can be'
+            if n_commuting_terms > 0:
+                H_nc = AC_full * H_sym + H_sym
+                assert n_commuting_terms*n_cliques + n_commuting_terms == H_nc.n_terms, 'operator not largest it can be'
+            else:
+                H_nc = AC_full * H_sym + H_sym
+                assert AC.n_terms + 1 == H_nc.n_terms, 'operator not largest it can be'
 
         coeff_vec = np.random.randn(H_nc.n_terms).astype(complex)
         if complex_coeffs:
             coeff_vec += 1j * np.random.randn(H_nc.n_terms)
 
-        # apply clifford rotations to get rid of some of generation structure
-        U_cliff_rotations = []
-        for _ in range(n_qubits * 5):
-            P_rand = PauliwordOp.random(H_nc.n_qubits, n_terms=1)
-            P_rand.coeff_vec = [1]
-            U_cliff_rotations.append((P_rand, None))
+        if apply_clifford:
+            # apply clifford rotations to get rid of some of generation structure
+            U_cliff_rotations = []
+            for _ in range(n_qubits * 5):
+                P_rand = PauliwordOp.random(H_nc.n_qubits, n_terms=1)
+                P_rand.coeff_vec = [1]
+                U_cliff_rotations.append((P_rand, (np.pi/2)*np.random.choice([1,3])))
 
-        H_nc = H_nc.perform_rotations(U_cliff_rotations)
+            H_nc = H_nc.perform_rotations(U_cliff_rotations)
 
         return cls(H_nc.symp_matrix, coeff_vec)
 
@@ -503,37 +513,6 @@ class NoncontextualOp(PauliwordOp):
         self.pauli_mult_signs = np.array(
             list(map(multiply_indices,jordan_recon_matrix.astype(bool)))
         ).astype(int)
-        
-    def symmetrized_operator(self, expansion_order=1):
-        """ 
-        Get the symmetrized noncontextual operator S_0 - sqrt(S_1^2 + .. S_M^2).
-        In the infinite limit of expansion_order the ground state of this operator
-        will coincide exactly with the true noncontextual operator. This is used
-        for xUSO solver since this reformulation of the Hamiltonian is polynomial.
-
-        Args:
-            expansion_order (int): Expansion order. By default, it is set to 1.
-
-        Returns:
-            Symmetrized noncontextual operator.
-        """
-        Si_list = [self.decomposed['symmetry']]
-        for i in range(self.n_cliques):
-            Ci = self.decomposed[i][0]; Ci.coeff_vec[0]=1
-            Si = Ci*self.decomposed[i]
-            Si_list.append(Si)
-
-        S = sum([Si**2 for Si in Si_list[1:]])
-        norm = np.linalg.norm(S.coeff_vec, ord=1)
-        S *= (1/norm)
-        I = PauliwordOp.from_list(['I'*self.n_qubits])
-        terms = [
-            (I-S)**n * (-1)**n * binomial_coefficient(.5, n) 
-            for n in range(expansion_order+1)
-        ] # power series expansion of the oeprator root
-        S_root = sum(terms) * np.sqrt(norm)
-        
-        return Si_list[0] - S_root
 
     def get_symmetry_contributions(self, nu: np.array) -> float:
         """
@@ -551,12 +530,12 @@ class NoncontextualOp(PauliwordOp):
         si = np.array([np.sum(coeff_mod[mask]).real for mask in self.mask_Ci])
         return s0, si
 
-    def get_energy(self, nu: np.array) -> float:
-        """
+    def get_energy(self, nu: np.array, AC_ev: int = -1) -> float:
+        """ 
         The classical objective function that encodes the noncontextual energies.
         """
         s0, si = self.get_symmetry_contributions(nu)
-        return s0 - np.linalg.norm(si)
+        return s0 + AC_ev * np.linalg.norm(si, ord=2)
     
     def update_clique_representative_operator(self, clique_index:int = None) -> List[Tuple[PauliwordOp, float]]:
         _, si = self.get_symmetry_contributions(self.symmetry_generators.coeff_vec)
@@ -572,21 +551,16 @@ class NoncontextualOp(PauliwordOp):
         
     def solve(self, 
             strategy: str = 'brute_force', 
-            ref_state: np.array = None, 
-            num_anneals:int = 1_000,
-            expansion_order:int = 1
+            ref_state: np.array = None
         ) -> None:
         """ 
         Minimize the classical objective function, yielding the noncontextual 
         ground state. This updates the coefficients of the clique representative 
         operator C(r) and symmetry generators G with the optimal configuration.
 
-        Note: Most QUSO functions/methods work faster than their PUSO counterparts.
-
         Args:
-            strategy (str): Optimization strategy. By default it is set to 'brute_force'. It can be 'brute_force', 'binary_relaxation', 'brute_force_PUSO', 'brute_force_QUSO', 'annealing_PUSO', or 'annealing_QUSO'.
-            ref_state (np.array): Reference State.
-            num_anneals (int): Number of simulated anneals to do.
+            strategy (str): Optimization strategy. By default it is set to 'brute_force'. It can be 'brute_force' or 'binary_relaxation'.
+            ref_state (np.array): Reference State
             expansion_order (int): Expansion order. By default, it is set to 1.
         """
         if ref_state is not None:
@@ -600,42 +574,19 @@ class NoncontextualOp(PauliwordOp):
         else:
             NC_solver = NoncontextualSolver(self)
 
-        NC_solver.num_anneals = num_anneals
-        NC_solver.expansion_order = expansion_order
-
         if strategy=='brute_force':
             self.energy, nu = NC_solver.energy_via_brute_force()
-
         elif strategy=='binary_relaxation':
             self.energy, nu = NC_solver.energy_via_relaxation()
-        
         else:
-            #### qubovert strategies below this point ####
-            # PUSO = Polynomial unconstrained spin Optimization
-            # QUSO: Quadratic Unconstrained Spin Optimization
-            if strategy == 'brute_force_PUSO':
-                NC_solver.method = 'brute_force'
-                NC_solver.x = 'P'   
-            elif strategy == 'brute_force_QUSO':  
-                NC_solver.method = 'brute_force'
-                NC_solver.x = 'Q'
-            elif strategy == 'annealing_PUSO':
-                NC_solver.method = 'annealing'
-                NC_solver.x = 'P'
-            elif strategy == 'annealing_QUSO':
-                NC_solver.method = 'annealing'
-                NC_solver.x = 'Q'
-            else:
-                raise ValueError(f'Unknown optimization strategy: {strategy}')
-        
-            self.energy, nu = NC_solver.energy_xUSO()
-
+            raise ValueError(f'Unknown optimization strategy: {strategy}')
+    
         # optimize the clique operator coefficients
         self.symmetry_generators.coeff_vec = nu.astype(int)
         if self.n_cliques > 0:
             self.update_clique_representative_operator()
 
-    def noncon_state(self, UP_method:Optional[str]= 'LCU') -> Tuple[QuantumState, np.array]:
+    def noncon_state(self, UP_method = 'LCU') -> Tuple[QuantumState, np.array]:
         """
         Method to generate noncontextual state for current symmetry generators assignments. Note by default
         UP_method is set to LCU as this avoids generating exponentially large states (which seq_rot can do!)
@@ -649,66 +600,51 @@ class NoncontextualOp(PauliwordOp):
 
         """
         nu_assignment = self.symmetry_generators.coeff_vec.copy()
-
         ## update clique coeffs from nu assignment!
         _, si = self.get_symmetry_contributions(nu_assignment)
         self.clique_operator.coeff_vec = si
-
         assert UP_method in ['LCU', 'seq_rot']
-
         if UP_method == 'LCU':
-            Ps, rotations_LCU, gamma_l, AC_normed = self.clique_operator.unitary_partitioning(s_index=0,
-                                                                                                  up_method='LCU')
+            rotations_LCU = self.clique_operator.R_LCU
+            Ps, rotations_LCU, gamma_l, AC_normed = self.clique_operator.unitary_partitioning(s_index=0,up_method='LCU')
         else:
-            Ps, rotations_SEQ, gamma_l, AC_normed = self.clique_operator.unitary_partitioning(s_index=0,
-                                                                                   up_method='seq_rot')
-
+            Ps, rotations_SEQ, gamma_l, AC_normed = self.clique_operator.unitary_partitioning(s_index=0,up_method='seq_rot')
         # choose negative value for clique operator (to minimize energy)
         Ps.coeff_vec[0] = -1
-
         ### to find ground state, need to map noncontextual stabilizers to single qubit Pauli Zs
         independent_stabilizers = self.symmetry_generators + Ps
-
         # rotate onto computational basis
         independent_stabilizers.target_sqp = 'Z'
-
         rotated_stabs = independent_stabilizers.rotate_onto_single_qubit_paulis()
         clifford_rots = independent_stabilizers.stabilizer_rotations
-
         ## get stabilizer state for the rotated stabilizers
-        Z_indices = np.sum(rotated_stabs.Z_block, axis=0)
-        Z_vals = np.sum(rotated_stabs.Z_block[:, Z_indices.astype(bool)] * rotated_stabs.coeff_vec, axis=1)
-        Z_indices[Z_indices.astype(bool)] = ((Z_vals - 1) * -0.5).astype(int)
-
-        state = QuantumState(Z_indices.reshape(1, -1))
-
+        nc_vec = np.zeros(self.n_qubits, dtype=int)
+        for val,row in zip(rotated_stabs.coeff_vec, rotated_stabs.Z_block):
+            assert np.count_nonzero(row) == 1
+            nc_vec[row] = (1-val)/2
+        state = QuantumState(nc_vec)
         ## undo clifford rotations
         from symmer.evolution.exponentiation import exponentiate_single_Pop
-        for op, _ in clifford_rots:
+        for op, _ in clifford_rots[::-1]:
             rot = exponentiate_single_Pop(op.multiply_by_constant(1j * np.pi / 4))
             state = rot.dagger * state
-
         ## undo unitary partitioning step
         if UP_method == 'LCU':
-            state = rotations_LCU.dagger * state
+            state = self.clique_operator.R_LCU.dagger * state
         else:
             for op, angle in rotations_SEQ[::-1]:
                 state = exponentiate_single_Pop(op.multiply_by_constant(1j * angle / 2)).dagger * state
-
         # TODO: could return clifford and UP rotations here too!
-        return state, nu_assignment    
+        return state, nu_assignment
+
 ###############################################################################
 ################### NONCONTEXTUAL SOLVERS BELOW ###############################
 ###############################################################################
 
 class NoncontextualSolver:
 
-    # xUSO settings
     method:str = 'brute_force'
-    x:str = 'P'
-    num_anneals:int = 1_000,
-    _nu = None,
-    expansion_order=1
+    _nu = None
 
     def __init__(
         self,
@@ -777,97 +713,7 @@ class NoncontextualSolver:
         fix_nu = np.sign(np.array(get_nu(np.cos(optimizer_output['x'])))).astype(int)
         self.NC_op.symmetry_generators.coeff_vec = fix_nu 
         return optimizer_output['fun'], fix_nu
-    
-    #################################################################
-    ################ UNCONSTRAINED SPIN OPTIMIZATION ################
-    #################################################################    
 
-    def get_cost_func(self):
-        """ 
-        Define the unconstrained spin cost function.
-        """
-        symmetrized_operator = self.NC_op.symmetrized_operator(expansion_order=self.expansion_order)
-        G_indices, _ = symmetrized_operator.generator_reconstruction(self.NC_op.symmetry_generators)
-        # setup spin variables
-        fixed_indices = np.where(self.fixed_ev_mask)[0] # bool to indices
-        fixed_assignments = dict(zip(fixed_indices, self.fixed_eigvals))
-        q_vec_SPIN={}
-        for ind in range(self.NC_op.symmetry_generators.n_terms):
-            if ind in fixed_assignments.keys():
-                q_vec_SPIN[ind] = fixed_assignments[ind]
-            else:
-                q_vec_SPIN[ind] = qv.spin_var('x%d' % ind)
-
-        COST = 0
-        for P_index, term in enumerate(G_indices):
-            non_zero_inds = term.nonzero()[0]
-            # collect all the spin terms
-            G_term = 1
-            for i in non_zero_inds:
-                G_term *= q_vec_SPIN[i]
-
-            # cost function
-            COST += (
-                G_term * 
-                symmetrized_operator.coeff_vec[P_index].real
-                #self.NC_op.pauli_mult_signs[P_index]# * 
-                #r_part[P_index].real
-            )
-
-        return COST
-
-    def energy_xUSO(self) -> Tuple[float, np.array, np.array]:
-        """
-        Get energy via either: Polynomial unconstrained spin Optimization (x=P)
-                                    or
-                                Quadratic Unconstrained Spin Optimization  (x=Q)
-
-        via a brute force search over q_vector or via simulated annealing
-
-        Note in this method the r_vector is fixed upon input! (aka just does binary optimization)
-
-        Args:
-            NC_op (NoncontextualOp): Non-contextual operator
-            fixed_ev_mask (np.array): bool list of where eigenvalues in nu vector are fixed
-            fixed_eigvals (np.array): list of nu eigenvalues that are fixed
-            method (str): brute force or annealing optimization
-            x (str): Whether method is Polynomial or Quadratic optimization
-            num_anneals (optional): number of simulated anneals to do
-
-        Returns:
-            energy (float): noncontextual energy
-        """
-        assert self.x in ['P', 'Q']
-        assert self.method in ['brute_force', 'annealing']
-        
-        COST = self.get_cost_func()
-        
-        if np.all(self.fixed_ev_mask):
-            # if no degrees of freedom over nu vector, COST is a number
-            nu_vec = self.fixed_eigvals
-        else:
-            if self.x =='P':
-                spin_problem = COST.to_puso()
-            else:
-                spin_problem = COST.to_quso()
-
-            if self.method=='brute_force':
-                sol = spin_problem.solve_bruteforce()
-            elif self.method == 'annealing':
-                if self.x == 'P':
-                    puso_res = qv.sim.anneal_puso(spin_problem, num_anneals=self.num_anneals)
-                elif self.x == 'Q':
-                    puso_res= qv.sim.anneal_quso(spin_problem, num_anneals=self.num_anneals)
-                    assert COST.is_solution_valid(puso_res.best.state) is True
-                sol = puso_res.best.state
-
-            solution = COST.convert_solution(sol)
-            nu_vec = np.ones(self.NC_op.symmetry_generators.n_terms, dtype=int)
-            nu_vec[self.fixed_ev_mask] = self.fixed_eigvals
-            # must ensure the binary variables are correctly ordered in the solution:
-            nu_vec[~self.fixed_ev_mask] = np.array([solution[x_i] for x_i in sorted(COST.variables)])
-        
-        return self.NC_op.get_energy(nu_vec), nu_vec
 
 @process.parallelize
 def get_noncon_energy(nu: np.array, noncon_H:NoncontextualOp) -> float:

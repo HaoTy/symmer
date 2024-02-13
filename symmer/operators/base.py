@@ -4,18 +4,21 @@ import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 from symmer import process
-from symmer.operators.utils import *
-from symmer.operators.utils import _cref_binary
+from symmer.operators.utils import (
+    matmul_GF2, random_symplectic_matrix, string_to_symplectic, QubitOperator_to_dict, SparsePauliOp_to_dict,
+    symplectic_to_string, cref_binary, check_independent, check_jordan_independent, symplectic_cleanup,
+    check_adjmat_noncontextual, symplectic_to_openfermion, binary_array_to_int, count1_in_int_bitstring
+)
 from tqdm.auto import tqdm
 from copy import deepcopy
 from functools import reduce
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict, Tuple
 from numbers import Number
 from cached_property import cached_property
 from scipy.stats import unitary_group
 from scipy.sparse import csr_matrix, csc_matrix, coo_matrix, dok_matrix
 from openfermion import QubitOperator, count_qubits
-from qiskit.opflow import PauliSumOp as ibm_PauliSumOp
+from qiskit.quantum_info import SparsePauliOp
 warnings.simplefilter('always', UserWarning)
 
 from numba.core.errors import NumbaDeprecationWarning, NumbaPendingDeprecationWarning
@@ -195,19 +198,19 @@ class PauliwordOp:
 
     @classmethod
     def from_qiskit(cls,
-            qiskit_op: ibm_PauliSumOp
+            qiskit_op: SparsePauliOp
         ) -> "PauliwordOp":
         """ 
-        Initialize a PauliwordOp from Qiskit's PauliSumOp representation.
+        Initialize a PauliwordOp from Qiskit's SparsePauliOp representation.
 
         Args:
-            qiskit_op (ibm_PauliSumOp): The PauliSumOp to initialize from.
+            qiskit_op (SparsePauliOp): The SparsePauliOp to initialize from.
 
         Returns:
             PauliwordOp: A new PauliwordOp object.
         """
-        assert(isinstance(qiskit_op, ibm_PauliSumOp)), 'Must supply a PauliSumOp'
-        operator_dict = PauliSumOp_to_dict(
+        assert(isinstance(qiskit_op, SparsePauliOp)), 'Must supply a SparsePauliOp'
+        operator_dict = SparsePauliOp_to_dict(
             qiskit_op
         )
         return cls.from_dictionary(operator_dict)
@@ -458,6 +461,8 @@ class PauliwordOp:
         """
         if by == 'magnitude':
             sort_order = np.argsort(-abs(self.coeff_vec))
+        elif by == 'lex':
+            sort_order = np.lexsort(self.symp_matrix.T)
         elif by == 'weight':
             sort_order = np.argsort(-np.sum(self.symp_matrix.astype(int), axis=1))
         elif by == 'support':
@@ -641,8 +646,8 @@ class PauliwordOp:
         Returns:
             bool: True if the two PauliwordOp objects are equal, False otherwise.
         """
-        check_1 = self.cleanup()
-        check_2 = Pword.cleanup()
+        check_1 = self.cleanup().sort('lex')
+        check_2 = Pword.cleanup().sort('lex')
         if check_1.n_qubits != check_2.n_qubits:
             raise ValueError('Operators defined over differing numbers of qubits.')
         elif check_1.n_terms != check_2.n_terms:
@@ -751,42 +756,16 @@ class PauliwordOp:
         """
         return PauliwordOp(self.symp_matrix, self.coeff_vec*const)
 
-    def _mul_symplectic(self, 
-            symp_vec: np.array, 
-            coeff: complex, 
-            Y_count_in: np.array
-        ) -> Tuple[np.array, np.array]:
-        """ 
-        Performs Pauli multiplication with phases at the level of the symplectic 
-        matrices to avoid superfluous PauliwordOp initializations. The phase compensation 
-        is implemented as per https://doi.org/10.1103/PhysRevA.68.042318.
-
-        Args:
-            symp_vec (np.array): The symplectic vector representing the Pauli operator to be multiplied with.
-            coeff (complex): The complex coefficient of the Pauli operator.
-            Y_count_in (np.array): The Y-counts of the input Pauli operator.
-
-        Returns:
-            Tuple[np.array, np.array]: The resulting symplectic vector and coefficient vector after multiplication.
-        """
-        # phaseless multiplication is binary addition in symplectic representation
-        phaseless_prod = np.bitwise_xor(self.symp_matrix, symp_vec)
-        # phase is determined by Y counts plus additional sign flip
-        Y_count_out = np.sum(np.bitwise_and(*np.hsplit(phaseless_prod,2)), axis=1)
-        sign_change = (-1) ** (
-            np.sum(np.bitwise_and(self.X_block, np.hsplit(symp_vec,2)[1]), axis=1) % 2
-        ) # mod 2 as only care about parity
-        # final phase modification
-        phase_mod = sign_change * (1j) ** ((3*Y_count_in + Y_count_out) % 4) # mod 4 as roots of unity
-        coeff_vec = phase_mod * self.coeff_vec * coeff
-        return phaseless_prod, coeff_vec
-
     def _multiply_by_operator(self, 
             PwordOp: Union["PauliwordOp", "QuantumState", complex],
             zero_threshold: float = 1e-15
         ) -> "PauliwordOp":
         """ 
         Right-multiplication of this PauliwordOp by another PauliwordOp or QuantumState ket.
+
+        Performs Pauli multiplication with phases at the level of the symplectic 
+        matrices to avoid superfluous PauliwordOp initializations. The phase compensation 
+        is implemented as per https://doi.org/10.1103/PhysRevA.68.042318.
 
         Args:
             PwordOp (Union["PauliwordOp", "QuantumState", complex]): The operator or ket to multiply by.
@@ -796,27 +775,18 @@ class PauliwordOp:
             PauliwordOp: The resulting PauliwordOp after multiplication.
         """
         assert (self.n_qubits == PwordOp.n_qubits), 'PauliwordOps defined for different number of qubits'
-
-        if PwordOp.n_terms == 1:
-            # no cleanup if multiplying by a single term (faster)
-            symp_stack, coeff_stack = self._mul_symplectic(
-                symp_vec=PwordOp.symp_matrix, 
-                coeff=PwordOp.coeff_vec, 
-                Y_count_in=self.Y_count+PwordOp.Y_count
+        Q_symp_matrix = PwordOp.symp_matrix.reshape([PwordOp.n_terms, 1, 2*PwordOp.n_qubits])
+        termwise_phaseless_prod = self.symp_matrix ^ Q_symp_matrix
+        Y_count_in  = self.Y_count + PwordOp.Y_count.reshape(-1,1)
+        Y_count_out = np.sum(termwise_phaseless_prod[:,:,:PwordOp.n_qubits] & termwise_phaseless_prod[:,:,PwordOp.n_qubits:], axis=2)
+        sign_change = (-1) ** (np.sum(self.X_block & Q_symp_matrix[:,:,PwordOp.n_qubits:], axis=2) % 2)
+        phase_mod = sign_change * (1j) ** ((3*Y_count_in + Y_count_out) % 4)
+        return PauliwordOp(
+            *symplectic_cleanup(
+                termwise_phaseless_prod.reshape(-1,2*self.n_qubits), 
+                (phase_mod * np.outer(self.coeff_vec, PwordOp.coeff_vec).T).reshape(-1), zero_threshold=zero_threshold
             )
-            pauli_mult_out = PauliwordOp(symp_stack, coeff_stack)
-        else:
-            # multiplication is performed at the symplectic level, before being stacked and cleaned
-            symp_stack, coeff_stack = zip(
-                *[self._mul_symplectic(symp_vec=symp_vec, coeff=coeff, Y_count_in=self.Y_count+Y_count) 
-                for symp_vec, coeff, Y_count in zip(PwordOp.symp_matrix, PwordOp.coeff_vec, PwordOp.Y_count)]
-            )
-            pauli_mult_out = PauliwordOp(
-                *symplectic_cleanup(
-                    np.vstack(symp_stack), np.hstack(coeff_stack), zero_threshold=zero_threshold
-                )
-            )
-        return pauli_mult_out
+        )
     
     def expval(self, psi: "QuantumState") -> complex:
         """ 
@@ -829,16 +799,19 @@ class PauliwordOp:
         Returns:
             complex: The expectation value.
         """
-        if self.n_terms > 1:
-            @process.parallelize
-            def f(P, psi):
-                return single_term_expval(P, psi)
-
-            expvals = np.array(f(self, psi))
+        if self.n_terms > psi.n_terms and psi.n_terms > 10:
+            return (psi.dagger * self * psi).real
         else:
-            expvals = np.array(single_term_expval(self, psi))
+            if self.n_terms > 1:
+                @process.parallelize
+                def f(P, psi):
+                    return single_term_expval(P, psi)
 
-        return np.sum(expvals * self.coeff_vec)
+                expvals = np.array(f(self, psi))
+            else:
+                expvals = np.array(single_term_expval(self, psi))
+
+            return np.sum(expvals * self.coeff_vec).real
 
     def __mul__(self, 
             mul_obj: Union["PauliwordOp", "QuantumState", complex],
@@ -942,7 +915,7 @@ class PauliwordOp:
         elif isinstance(key, (list, np.ndarray)):
             mask = np.asarray(key)
         else:
-            raise ValueError('Unrecognised input, must be an integer, slice, list or np.array')
+            raise ValueError(f'Unrecognised input {type(key)}, must be an integer, slice, list or np.array')
         
         symp_items = self.symp_matrix[mask]
         coeff_items = self.coeff_vec[mask]
@@ -987,8 +960,10 @@ class PauliwordOp:
         # return np.logical_not(adjacency_matrix.toarray())
 
         ### dense code
-        Omega_PwordOp_symp = np.hstack((PwordOp.Z_block,  PwordOp.X_block)).astype(int)
-        return (self.symp_matrix @ Omega_PwordOp_symp.T) % 2 == 0
+        # Omega_PwordOp_symp = np.hstack((PwordOp.Z_block,  PwordOp.X_block)).astype(int)
+        # return (self.symp_matrix @ Omega_PwordOp_symp.T) % 2 == 0
+        
+        return ~matmul_GF2(self.symp_matrix, np.hstack((PwordOp.Z_block,  PwordOp.X_block)).T)
 
     def anticommutes_termwise(self,
             PwordOp: "PauliwordOp"
@@ -1068,8 +1043,9 @@ class PauliwordOp:
         Returns:
             bool: True if all terms commute, False otherwise.
         """
-        return self.commutator(PwordOp).n_terms == 0
-    
+        commutator = self.commutator(PwordOp).cleanup()
+        return (commutator.n_terms == 0 or np.all(commutator.coeff_vec[0] == 0))
+        
     @cached_property
     def adjacency_matrix(self) -> np.array:
         """ 
@@ -1094,7 +1070,8 @@ class PauliwordOp:
     def is_noncontextual(self) -> bool:
         """ 
         Returns True if the operator is noncontextual, False if contextual
-        Scales as O(N^2), compared with the O(N^3) algorithm of https://doi.org/10.1103/PhysRevLett.123.200501
+        Scales as O(M^2), compared with the O(M^3) algorithm of https://doi.org/10.1103/PhysRevLett.123.200501
+        where M is the number of terms in the operator.
         Constructing the adjacency matrix is by far the most expensive part - very fast once that has been built.
 
         Returns:
@@ -1103,48 +1080,12 @@ class PauliwordOp:
         if self.n_terms < 4:
             # all operators with 3 or less P are noncontextual
             return True
-
-        to_reduce = np.vstack([np.hstack([self.Z_block, self.X_block]), np.eye(2 * self.n_qubits, dtype=bool)])
-        cref_matrix = _cref_binary(to_reduce)
-        Z2_symp = cref_matrix[self.n_terms:, np.all(~cref_matrix[:self.n_terms], axis=0)].T
-        Z2_terms = PauliwordOp(Z2_symp, np.ones(Z2_symp.shape[0]))
-
-        if Z2_terms.n_terms < 1:
-            remaining = self.cleanup()
-            if remaining.n_terms > 2 * remaining.n_qubits + 1:
-                # no symmetry component, therefore operator must be made up of pairwise
-                # anticommuting pauli operators to be noncontextual. This can have a max size of 2n+1, if larger cannot
-                # be noncontextual
-                return False
-            else:
-                # for remaining to be noncontextual must be disjoint union of cliques
-                # we can test for this below
-                adj_matrix_view = np.ascontiguousarray(remaining.adjacency_matrix).view(
-                    np.dtype((np.void, remaining.adjacency_matrix.dtype.itemsize * remaining.adjacency_matrix.shape[1]))
-                )
-                re_order_indices = np.argsort(adj_matrix_view.ravel())
-                # sort the adj matrix and vector of coefficients accordingly
-                sorted_terms = remaining.adjacency_matrix[re_order_indices]
-                # unique terms are those with non-zero entries in the adjacent row difference array
-                diff_adjacent = np.diff(sorted_terms, axis=0)
-                mask_unique_terms = np.append(True, np.any(diff_adjacent, axis=1))
-                clique_mask = sorted_terms[mask_unique_terms]
-
-                # check for overlap (array of ones == no overlap)
-                return np.all(np.sum(clique_mask, axis=0) == 1)
-        else:
-            gens = self.generators
-            if check_adjmat_noncontextual(gens.adjacency_matrix):
-                return True
-            from symmer.utils import get_generators_including_xz_products
-            gens_xyz = get_generators_including_xz_products(self)
-            return check_adjmat_noncontextual(gens_xyz.adjacency_matrix)
-
-
+        return check_adjmat_noncontextual(self.adjacency_matrix)
 
     def _rotate_by_single_Pword(self,
             Pword: "PauliwordOp", 
-            angle: float = None
+            angle: float = None,
+            threshold: float = 1e-18
         ) -> "PauliwordOp":
         """ 
         Let R(t) = e^{i t/2 Q} = cos(t/2)*I + i*sin(t/2)*Q, then one of the following can occur:
@@ -1160,10 +1101,17 @@ class PauliwordOp:
         Args:
             Pword (PauliwordOp): The Pauliword to rotate by.
             angle (float): The rotation angle in radians. If None, a Clifford rotation (angle=pi/2) is assumed.
-
+            threshold (float): Angle threshold for Clifford rotation (precision to which the angle is a multiple of pi/2)
         Returns:
             PauliwordOp: The rotated operator.
         """
+        if angle is None: # for legacy compatibility
+            angle = np.pi/2
+
+        if angle.imag != 0:
+            warnings.warn('Complex component in angle: this will be ignored.')
+        angle = angle.real
+
         assert(Pword.n_terms==1), 'Only rotation by single Pauliword allowed here'
         if Pword.coeff_vec[0] != 1:
             # non-1 coefficients will affect the sign and angle in the exponent of R(t)
@@ -1183,15 +1131,25 @@ class PauliwordOp:
             commute_self = PauliwordOp(self.symp_matrix[commute_vec], self.coeff_vec[commute_vec])
             anticom_self = PauliwordOp(self.symp_matrix[~commute_vec], self.coeff_vec[~commute_vec])
 
-            if angle is None:
-                # assumes pi/2 rotation so Clifford
-                anticom_part = (anticom_self*Pword_copy).multiply_by_constant(-1j)
+            multiple = angle * 2 / np.pi
+            int_part = round(multiple)
+            if abs(int_part - multiple)<=threshold:
+                if int_part % 2 == 0:
+                    # no rotation for angle congruent to 0 or pi disregarding sign, fixed in next line
+                    anticom_part = anticom_self
+                else:
+                    # rotation of -pi/2 disregarding sign, fixed in next line
+                    anticom_part = (anticom_self*Pword_copy).multiply_by_constant(-1j)
+                if int_part in [2,3]:
+                    anticom_part = anticom_part.multiply_by_constant(-1)
                 # if rotation is Clifford cannot produce duplicate terms so cleanup not necessary
                 return PauliwordOp(
                     np.vstack([anticom_part.symp_matrix, commute_self.symp_matrix]), 
                     np.hstack([anticom_part.coeff_vec, commute_self.coeff_vec])
                 )
             else:
+                if abs(angle)>1e6:
+                    warnings.warn('Large angle can lead to precision errors: recommend using high-precision math library such as mpmath or redefine angle in range [-pi, pi]')
                 # if angle is specified, performs non-Clifford rotation
                 anticom_part = (anticom_self.multiply_by_constant(np.cos(angle)) + 
                                 (anticom_self*Pword_copy).multiply_by_constant(-1j*np.sin(angle)))
@@ -1215,9 +1173,12 @@ class PauliwordOp:
             PauliwordOp: The operator after performing the rotations.
         """
         op_copy = self.copy()
-        for pauli_rotation, angle in rotations:
-            op_copy = op_copy._rotate_by_single_Pword(pauli_rotation, angle).cleanup()
-        return op_copy
+        if rotations == []:
+            return op_copy.cleanup()
+        else:
+            for pauli_rotation, angle in rotations:
+                op_copy = op_copy._rotate_by_single_Pword(pauli_rotation, angle).cleanup()
+            return op_copy
 
     def tensor(self, right_op: "PauliwordOp") -> "PauliwordOp":
         """ 
@@ -1229,8 +1190,8 @@ class PauliwordOp:
         Returns:
             PauliwordOp: The resulting Pauli operator after the tensor product.
         """
-        identity_block_right = np.zeros([right_op.n_terms, self.n_qubits]).astype(int)
-        identity_block_left  = np.zeros([self.n_terms,  right_op.n_qubits]).astype(int)
+        identity_block_right = np.zeros([right_op.n_terms, self.n_qubits], dtype=bool)#.astype(int)
+        identity_block_left  = np.zeros([self.n_terms,  right_op.n_qubits], dtype=bool)#.astype(int)
         padded_left_symp = np.hstack([self.X_block, identity_block_left, self.Z_block, identity_block_left])
         padded_right_symp = np.hstack([identity_block_right, right_op.X_block, identity_block_right, right_op.Z_block])
         left_factor = PauliwordOp(padded_left_symp, self.coeff_vec)
@@ -1238,15 +1199,28 @@ class PauliwordOp:
         return left_factor * right_factor
 
     def get_graph(self, 
-            edge_relation = 'C'
+            edge_relation: Optional[str]='C',
+             label_nodes: Optional[bool]=False
         ) -> nx.graph:
-        """ 
-        Build a graph based on edge relation C (commuting), 
-        AC (anticommuting) or QWC (qubitwise commuting).
+        """
+        Build a graph based on edge relation C (commuting), AC (anticommuting) or QWC (qubitwise commuting).
+        Note if label_nodes set to True then node names are pauli operators.
+
+        To draw:
+        import networkx as nx
+        H = PauliwordOp.random(3, 10)
+        graph = H.get_graph(edge_relation='C', label_nodes=True)
+        nx.draw(graph,
+                with_labels = True,
+                alpha=0.75,
+                node_color="skyblue",
+                width=0.1,
+                node_size=750
+        )
 
         Args:
             edge_relation (str): The edge relation to consider. Options are 'C' for commuting, 'AC' for anticommuting, and 'QWC' for qubitwise commuting. Defaults to 'C'.
-
+            label_nodes (bool): flag to label nodes of graph
         Returns:
             nx.Graph: The graph representing the edge relation.
         """
@@ -1262,6 +1236,12 @@ class PauliwordOp:
         np.fill_diagonal(adjmat,False) # avoids self-adjacency
         # convert to a networkx graph and perform colouring on complement
         graph = nx.from_numpy_array(adjmat)
+
+        if label_nodes:
+            node_list = np.apply_along_axis(symplectic_to_string, 1, self.symp_matrix).tolist()
+            mapping = dict(zip(range(len(node_list)), node_list))
+            graph = nx.relabel_nodes(graph, mapping)
+
         return graph
 
     def largest_clique(self,
@@ -1396,28 +1376,24 @@ class PauliwordOp:
         Convert to OpenFermion Pauli operator representation.
 
         Returns:
-            QubitOperator: The QubitOperator representation of the PauliwordOp.
+            open_f (QubitOperator): The QubitOperator representation of the PauliwordOp.
         """
-        pauli_terms = []
-        for symp_vec, coeff in zip(self.symp_matrix, self.coeff_vec):
-            pauli_terms.append(
-                QubitOperator(' '.join([Pi+str(i) for i,Pi in enumerate(symplectic_to_string(symp_vec)) if Pi!='I']),
-                coeff)
-            )
-        if len(pauli_terms) == 1:
-            return pauli_terms[0]
-        else:
-            return sum(pauli_terms)
+        open_f = QubitOperator()
+        for P_sym, coeff in zip(self.symp_matrix, self.coeff_vec):
+            open_f+=symplectic_to_openfermion(P_sym, coeff)
+        return open_f
 
     @cached_property
-    def to_qiskit(self) -> ibm_PauliSumOp:
+    def to_qiskit(self) -> SparsePauliOp:
         """ 
         Convert to Qiskit Pauli operator representation.
 
         Returns:
             PauliSumOp: The PauliSumOp representation of the PauliwordOp.
         """
-        return ibm_PauliSumOp.from_list(self.to_dictionary.items())
+        Pstr_list = np.apply_along_axis(symplectic_to_string, 1, self.symp_matrix).tolist()
+
+        return SparsePauliOp(Pstr_list, coeffs=self.coeff_vec.tolist())
 
     @cached_property
     def to_dictionary(self) -> Dict[str, complex]:
@@ -2020,6 +1996,45 @@ class QuantumState:
             # conjugate has already taken place, just need to make into row vector
             sparse_Qstate= sparse_Qstate.reshape([1,-1])
         return sparse_Qstate
+    
+    @cached_property
+    def to_dense_matrix(self):
+        """
+        Returns:
+            dense_Qstate (ndarray): dense matrix representation of the statevector
+        """
+        return self.to_sparse_matrix.toarray()
+    
+    def partial_trace_over_qubits(self, qubits: List[int] = []) -> np.ndarray:
+        """
+        Perform a partial trace over the specified qubit positions, 
+        yielding the reduced density matrix of the remaining subsystem.
+
+        Args:
+            qubits (List[int]): qubit indicies to trace over
+
+        Returns:
+            rho_reduced (ndarray): Reduced density matrix over the remaining subsystem
+        """
+        rho_reduced = self.to_dense_matrix.reshape([2]*self.n_qubits)
+        rho_reduced = np.tensordot(rho_reduced, rho_reduced.conj(), axes=(qubits, qubits))
+        d = int(np.sqrt(np.product(rho_reduced.shape)))
+        return rho_reduced.reshape(d, d)
+
+    def get_rdm(self, qubits: List[int] = []) -> np.ndarray:
+        """
+        Return the reduced density matrix of the specified qubit positions, 
+        corresponding with a partial trace over the complementary qubit indices
+        
+        Args:
+            qubits (List[int]): qubit indicies to preserve
+
+        Returns:
+            rho_reduced (ndarray): Reduced density matrix over the chosen subsystem
+        """
+        trace_over_indices = list(set(range(self.n_qubits)).difference(set(qubits)))
+        rho_reduced = self.partial_trace_over_qubits(trace_over_indices)
+        return rho_reduced
 
     def _is_normalized(self) -> bool:
         """
